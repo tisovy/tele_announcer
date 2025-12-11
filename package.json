@@ -1,0 +1,25 @@
+{
+  "name": "tele_announcer",
+  "version": "0.1.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "lint": "eslint .",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "Trade UI",
+  "license": "GPL-3.0",
+  "description": "Telegram announcer that watches Binance USDT markets and exposes analytics",
+  "dependencies": {
+    "@binance/connector": "^3.4.0",
+    "binance": "^2.12.1",
+    "express": "^4.19.2",
+    "redis": "^4.7.0",
+    "telegraf": "^4.16.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "eslint": "^9.12.0",
+    "globals": "^16.5.0"
+  }
+}
