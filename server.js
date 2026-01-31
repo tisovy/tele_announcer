@@ -293,7 +293,10 @@ const main = async () => {
   const sendAnnouncement = async (payload) => {
     const users = USER_LIST;
 
-    if (!users.length || !users[0].username) return;
+    if (!users.length || !users[0].username) {
+      console.log("USER_LIST is empty");
+      return;
+    }
 
     users.forEach((user) => {
       let text = "";
