@@ -193,7 +193,7 @@ const main = async () => {
         minNotificationTimeout = val * 1000;
         await updateState();
         ctx.reply(
-          `Значение min notification timout установлено на: ${minNotificationTimeout / 1000
+          `Значение min notification timeout установлено на: ${minNotificationTimeout / 1000
           }s`
         );
       } else {
