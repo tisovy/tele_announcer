@@ -4,6 +4,7 @@ const { Telegraf } = require("telegraf");
 const { message } = require("telegraf/filters");
 const { Console } = require("console");
 const cryptoLib = require("crypto");
+const https = require("https");
 const WebsocketStream = require("@binance/connector").WebsocketStream;
 const { AnalyticsEngine } = require("./server/analytics/metrics-engine");
 const { ActivityTracker } = require("./server/activity-tracker");
@@ -56,11 +57,70 @@ if (!TELE_ANNOUNCER) {
   console.error("Telegram Token not found in your env");
   process.exit(1);
 }
-// Telegram bot setup
-const bot = new Telegraf(TELE_ANNOUNCER);
+// Telegram bot setup — reuse TLS connections so we pay fewer connection-setup
+// timeouts when talking to the Bot API.
+const telegramAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 10000,
+  maxSockets: 64,
+});
+const bot = new Telegraf(TELE_ANNOUNCER, {
+  telegram: { agent: telegramAgent },
+});
 
 // Logger setup
 const logger = new Console({ stdout: process.stdout, stderr: process.stderr });
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Send one Telegram message with a hard per-attempt timeout and retries on
+// transient failures (timeouts, resets, aborts, 429, 5xx). Never throws, so a
+// single bad recipient can't stall the announcement loop or leak a rejection.
+const sendTelegramMessage = async (chatId, text, label = chatId) => {
+  const MAX_ATTEMPTS = 3;
+  const REQUEST_TIMEOUT_MS = 20000;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    const controller =
+      typeof AbortController === "function" ? new AbortController() : null;
+    const timer = controller
+      ? setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+      : null;
+
+    try {
+      await bot.telegram.callApi(
+        "sendMessage",
+        { chat_id: chatId, text, parse_mode: "HTML" },
+        controller ? { signal: controller.signal } : {}
+      );
+      return true;
+    } catch (error) {
+      const errorCode = error?.response?.error_code;
+      // Permanent errors — retrying won't help.
+      if (errorCode === 403) {
+        logger.error(`User ${label} has blocked the bot.`);
+        return false;
+      }
+      if (errorCode === 400) {
+        logger.error(
+          `Bad request sending to ${label}:`,
+          error.description || error
+        );
+        return false;
+      }
+
+      const reason = error?.code || error?.message || error;
+      logger.error(
+        `Error sending message to ${label} (attempt ${attempt}/${MAX_ATTEMPTS}): ${reason}`
+      );
+      if (attempt === MAX_ATTEMPTS) return false;
+      await sleep(1000 * attempt);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+  return false;
+};
 
 const analyticsEngine = new AnalyticsEngine({
   enabled: ANALYTICS_ENABLED,
@@ -75,6 +135,7 @@ const analyticsAuthConfigured = Boolean(
 );
 const analyticsRateBuckets = new Map();
 let analyticsPersistTimer;
+let marketStreamWatchdog;
 const activityTracker = new ActivityTracker({
   allowedQuotes: [QUOTE_SYMBOL],
 });
@@ -287,7 +348,17 @@ const main = async () => {
     console.error("Error with Telegram Bot message handling:", error);
   }
 
-  bot.launch();
+  bot.catch((error, ctx) => {
+    logger.error(
+      `Telegraf handler error (update ${ctx?.update?.update_id}):`,
+      error
+    );
+  });
+
+  bot.launch().catch((error) => {
+    logger.error("Failed to launch Telegram bot:", error);
+    process.exit(1);
+  });
 
   // Function to send announcements
   const sendAnnouncement = async (payload) => {
@@ -298,30 +369,30 @@ const main = async () => {
       return;
     }
 
+    // The message body is identical for every recipient — build it once.
+    let text = "";
+    payload.forEach((data) => {
+      text += formatMessage(data) + "\n";
+    });
+    text = text.trim();
+    if (!text) return;
+
     users.forEach((user) => {
-      let text = "";
-      payload.forEach((data) => {
-        text += formatMessage(data) + "\n";
-      });
-
-      text = text.trim();
-
-      bot.telegram
-        .sendMessage(user.id, text, { parse_mode: "HTML" })
-        .catch((error) => {
-          console.error(`Error sending message to ${user.username}:`, error);
-          if (error.code === 403) {
-            console.error(`User ${user.username} has blocked the bot.`);
-          }
-        });
+      // Fire-and-forget: sendTelegramMessage retries and never throws, so one
+      // slow/blocked recipient can't stall the others or the websocket loop.
+      void sendTelegramMessage(user.id, text, user.username || user.id);
     });
   };
 
   // WebSocket Stream setup for real-time updates
+  let lastWsMessageAt = Date.now();
   const websocketCallbacks = {
     open: () => logger.debug("Connected with WebSocket server"),
     close: () => logger.debug("Disconnected with WebSocket server"),
     message: async (data) => {
+      // Heartbeat for the watchdog: miniTicker pushes ~once per second, so a
+      // longer silence means the socket is dead even if it never fired 'close'.
+      lastWsMessageAt = Date.now();
       const messages = JSON.parse(data);
       const now = Date.now();
       let payload = [];
@@ -500,10 +571,19 @@ const main = async () => {
     )} ${percent}% (${dailyPercent}%) ${volume}`;
   };
 
-  const websocketStreamClient = new WebsocketStream({
-    logger,
-    callbacks: websocketCallbacks,
-  });
+  let websocketStreamClient;
+
+  // (Re)create the market-data stream. The connector auto-reconnects when the
+  // socket fires 'close', but a half-open/zombie TCP can silently stop
+  // delivering data without ever closing — the watchdog below covers that case.
+  const startMarketStream = () => {
+    websocketStreamClient = new WebsocketStream({
+      logger,
+      callbacks: websocketCallbacks,
+    });
+    websocketStreamClient.miniTicker();
+    lastWsMessageAt = Date.now();
+  };
 
   const updateState = async () => {
     // Update and save state
@@ -524,8 +604,39 @@ const main = async () => {
     await redis.set(DB_NAME, JSON.stringify(announcer));
   };
 
-  // Subscribe to all pairs miniTicker
-  websocketStreamClient.miniTicker();
+  // Subscribe to all pairs miniTicker and start watching the data flow.
+  startMarketStream();
+
+  // Watchdog: if no market data arrives for a while the socket is dead. Force
+  // it closed so the connector reconnects (re-subscribing via the stream URL).
+  const WS_STALE_TIMEOUT_MS = 60 * 1000;
+  const WS_WATCHDOG_INTERVAL_MS = 15 * 1000;
+  marketStreamWatchdog = setInterval(() => {
+    const silenceMs = Date.now() - lastWsMessageAt;
+    if (silenceMs <= WS_STALE_TIMEOUT_MS) return;
+
+    logger.error(
+      `No market data for ${Math.round(
+        silenceMs / 1000
+      )}s — forcing Binance websocket reconnect`
+    );
+    // Give the reconnect a full window to land before tripping again.
+    lastWsMessageAt = Date.now();
+
+    const ws = websocketStreamClient?.wsConnection?.ws;
+    if (ws && typeof ws.terminate === "function") {
+      // terminate() emits 'close' even on a half-open socket; the connector's
+      // close handler (closeInitiated === false) then reconnects on its own.
+      try {
+        ws.terminate();
+      } catch (error) {
+        logger.error("Failed to terminate stale websocket, recreating:", error);
+        startMarketStream();
+      }
+    } else {
+      startMarketStream();
+    }
+  }, WS_WATCHDOG_INTERVAL_MS);
 
   if (ANALYTICS_ENABLED) {
     analyticsPersistTimer = setInterval(async () => {
@@ -791,8 +902,22 @@ const shutdownBot = (signal) => {
   if (analyticsPersistTimer) {
     clearInterval(analyticsPersistTimer);
   }
+  if (marketStreamWatchdog) {
+    clearInterval(marketStreamWatchdog);
+  }
   bot.stop(signal);
 };
+
+// Last-resort safety nets so a stray error surfaces in the logs instead of
+// silently wedging the process. Uncaught exceptions exit so pm2 can restart.
+process.on("unhandledRejection", (reason) => {
+  logger.error("Unhandled promise rejection:", reason);
+});
+
+process.on("uncaughtException", (error) => {
+  logger.error("Uncaught exception, exiting so pm2 can restart:", error);
+  process.exit(1);
+});
 
 process.once("SIGINT", () => shutdownBot("SIGINT"));
 process.once("SIGTERM", () => shutdownBot("SIGTERM"));
