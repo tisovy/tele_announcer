@@ -30,6 +30,17 @@ const MARK_VOLUME_THRESHOLD = 100000000;
 const MIN_VOLUME_LIMIT = 500000;
 const BTC_SYMBOL = "BTCUSDT";
 const QUOTE_SYMBOL = "USDT";
+// Futures (USDⓈ-M) websocket base. The /market routed path is mandatory:
+// since 2026-04-23 the legacy unrouted fstream URLs only serve /public
+// streams (bookTicker, depth) — miniTicker subscriptions are acked but
+// deliver nothing.
+const FUTURES_WS_URL = "wss://fstream.binance.com/market";
+// Futures pairs share symbol names with spot (BTCUSDT), so their state entries
+// in lastPrices/lastHighPrices/etc. are namespaced with this prefix.
+const FUTURES_KEY_PREFIX = "F:";
+const SPOT_SYMBOLS_URL = "https://api.binance.com/api/v3/ticker/price";
+const SPOT_SYMBOLS_REFRESH_MS = 60 * 60 * 1000;
+const SPOT_SYMBOLS_RETRY_MS = 60 * 1000;
 const ANALYTICS_ENABLED = true;
 const ANALYTICS_API_KEY = process.env.ANALYTICS_API_KEY || "";
 const ANALYTICS_API_SECRET = process.env.ANALYTICS_API_SECRET || "";
@@ -186,6 +197,22 @@ let minNotificationTimeout = MIN_NOTIFICATION_TIMEOUT;
 let minPriceNotificatoinPercent = MIN_PRICE_NOTIFICATION_PERCENT;
 let minVolumeLimit = MIN_VOLUME_LIMIT;
 let lastSentNotificationTime = 0;
+// Symbols listed on spot — futures tickers matching one of these stay silent.
+let spotSymbols = new Set();
+let spotSymbolsTimer;
+
+// Load the spot symbol list and keep it fresh: hourly on success, quick retry
+// on failure. Keeps the previous set on errors so filtering never regresses.
+const refreshSpotSymbols = async () => {
+  try {
+    spotSymbols = await fetchSpotSymbols();
+    logger.log(`Loaded ${spotSymbols.size} spot symbols for futures filtering`);
+    spotSymbolsTimer = setTimeout(refreshSpotSymbols, SPOT_SYMBOLS_REFRESH_MS);
+  } catch (error) {
+    logger.error("Failed to load spot symbol list:", error);
+    spotSymbolsTimer = setTimeout(refreshSpotSymbols, SPOT_SYMBOLS_RETRY_MS);
+  }
+};
 
 const main = async () => {
   // Redis setup
@@ -384,139 +411,206 @@ const main = async () => {
     });
   };
 
-  // WebSocket Stream setup for real-time updates
-  let lastWsMessageAt = Date.now();
-  const websocketCallbacks = {
-    open: () => logger.debug("Connected with WebSocket server"),
-    close: () => logger.debug("Disconnected with WebSocket server"),
-    message: async (data) => {
-      // Heartbeat for the watchdog: miniTicker pushes ~once per second, so a
-      // longer silence means the socket is dead even if it never fired 'close'.
-      lastWsMessageAt = Date.now();
-      const messages = JSON.parse(data);
-      const now = Date.now();
-      let payload = [];
+  // Shared notification gate for spot and futures tickers. Rolls the stored
+  // state forward and returns the previous price when a notification should
+  // fire, or null when the ticker stays silent. stateKey is the plain symbol
+  // for spot and FUTURES_KEY_PREFIX + symbol for futures.
+  const evaluateTicker = ({
+    stateKey,
+    currentPrice,
+    highPrice,
+    lowPrice,
+    volume,
+    now,
+  }) => {
+    const checkData =
+      lastPrices[stateKey] &&
+      lastNotificationTime[stateKey] &&
+      lastHighPrices[stateKey] &&
+      lastLowPrices[stateKey];
+    if (!checkData) {
+      // init latestPrice and lastNotificationTime for a pair
+      lastPrices[stateKey] = currentPrice;
+      lastHighPrices[stateKey] = highPrice;
+      lastLowPrices[stateKey] = lowPrice;
+      lastNotificationTime[stateKey] = now - minNotificationTimeout;
+      return null;
+    }
 
-      // Loop through each ticker event in the array
-      for (const message of messages) {
-        if (message.e === "24hrMiniTicker" && /USDT/.test(message.s)) {
-          const pair = message.s; // Symbol (e.g., BNBBTC)
-          const currentPrice = parseFloat(message.c); // Current price
-          const highPrice = parseFloat(message.h);
-          const lowPrice = parseFloat(message.l);
-          const openPrice = parseFloat(message.o);
-          const volume = parseFloat(message.q) || 0;
-          const eventTime =
-            typeof message.E === "number" && !Number.isNaN(message.E)
-              ? message.E
-              : now;
+    const previousPrice = lastPrices[stateKey];
+    const priceChangePercent =
+      ((currentPrice - previousPrice) / previousPrice) * 100;
 
-          // collect Socket data
-          lastSocketData[pair] = message;
+    // (skip notification if:
+    // variables are undefined
+    // + last lastNotificationTime was > minNotificationTimeout ago
+    // + percent change is > than minPriceNotificatoinPercent
+    // OR
+    // price has breached High and Log daily prices
+    // + latest update was for [pair] was less than minNotificationTimeout
+    // + min notification for price breach is > than minPriceBreachTimeout)
+    // + min price breach percent is > than minPriceBreachPercent
+    // AND
+    // + minimum Volume is > than minVolumeLimit {
+    const firstCheck =
+      now - lastNotificationTime[stateKey] > minNotificationTimeout &&
+      Math.abs(priceChangePercent) > minPriceNotificatoinPercent;
 
-          if (ANALYTICS_ENABLED) {
-            analyticsEngine.ingest({
-              symbol: pair,
-              price: currentPrice,
-              volume,
-              timestamp: eventTime,
-            });
-          }
+    const isPriceBreach =
+      currentPrice > lastHighPrices[stateKey] ||
+      lastLowPrices[stateKey] > currentPrice;
 
-          activityTracker.ingest({
+    let isPercentBreach = false;
+    if (isPriceBreach) {
+      let percent = Math.abs(
+        currentPrice > lastHighPrices[stateKey]
+          ? ((currentPrice - lastHighPrices[stateKey]) /
+            lastHighPrices[stateKey]) *
+          100
+          : ((currentPrice - lastLowPrices[stateKey]) /
+            lastLowPrices[stateKey]) *
+          100
+      );
+      if (percent > minPriceBreachPercent) isPercentBreach = true;
+    }
+
+    const secondCheck =
+      isPercentBreach &&
+      now - lastNotificationTime[stateKey] > minPriceBreachTimeout;
+
+    const sendNotification =
+      (firstCheck || secondCheck) && volume > minVolumeLimit;
+    // }
+
+    if (!sendNotification) return null;
+
+    // Update the last notification timestamp and price
+    lastNotificationTime[stateKey] = now;
+    lastPrices[stateKey] = currentPrice;
+    lastHighPrices[stateKey] = highPrice;
+    lastLowPrices[stateKey] = lowPrice;
+    return previousPrice;
+  };
+
+  const handleSpotMessage = async (data) => {
+    const messages = JSON.parse(data);
+    const now = Date.now();
+    let payload = [];
+
+    // Loop through each ticker event in the array
+    for (const message of messages) {
+      if (message.e === "24hrMiniTicker" && /USDT/.test(message.s)) {
+        const pair = message.s; // Symbol (e.g., BNBBTC)
+        const currentPrice = parseFloat(message.c); // Current price
+        const highPrice = parseFloat(message.h);
+        const lowPrice = parseFloat(message.l);
+        const openPrice = parseFloat(message.o);
+        const volume = parseFloat(message.q) || 0;
+        const eventTime =
+          typeof message.E === "number" && !Number.isNaN(message.E)
+            ? message.E
+            : now;
+
+        // collect Socket data
+        lastSocketData[pair] = message;
+
+        if (ANALYTICS_ENABLED) {
+          analyticsEngine.ingest({
             symbol: pair,
             price: currentPrice,
             volume,
             timestamp: eventTime,
           });
+        }
 
-          // Calculate the percentage change from the last recorded price
-          const checkData =
-            lastPrices[pair] &&
-            lastNotificationTime[pair] &&
-            lastHighPrices[pair] &&
-            lastLowPrices[pair];
-          if (checkData) {
-            const previousPrice = lastPrices[pair];
-            const priceChangePercent =
-              ((currentPrice - previousPrice) / previousPrice) * 100;
+        activityTracker.ingest({
+          symbol: pair,
+          price: currentPrice,
+          volume,
+          timestamp: eventTime,
+        });
 
-            // (skip notification if:
-            // variables are undefined
-            // + last lastNotificationTime was > minNotificationTimeout ago
-            // + percent change is > than minPriceNotificatoinPercent
-            // OR
-            // price has breached High and Log daily prices
-            // + latest update was for [pair] was less than minNotificationTimeout
-            // + min notification for price breach is > than minPriceBreachTimeout)
-            // + min price breach percent is > than minPriceBreachPercent
-            // AND
-            // + minimum Volume is > than minVolumeLimit {
-            const firstCheck =
-              now - lastNotificationTime[pair] > minNotificationTimeout &&
-              Math.abs(priceChangePercent) > minPriceNotificatoinPercent;
-
-            const isPriceBreach =
-              currentPrice > lastHighPrices[pair] ||
-              lastLowPrices[pair] > currentPrice;
-
-            let isPercentBreach = false;
-            if (isPriceBreach) {
-              let percent = Math.abs(
-                currentPrice > lastHighPrices[pair]
-                  ? ((currentPrice - lastHighPrices[pair]) /
-                    lastHighPrices[pair]) *
-                  100
-                  : ((currentPrice - lastLowPrices[pair]) /
-                    lastLowPrices[pair]) *
-                  100
-              );
-              if (percent > minPriceBreachPercent) isPercentBreach = true;
-            }
-
-            const secondCheck =
-              isPercentBreach &&
-              now - lastNotificationTime[pair] > minPriceBreachTimeout;
-
-            const sendNotification =
-              (firstCheck || secondCheck) && volume > minVolumeLimit;
-            // }
-
-            // Ensure that the notification is sent only if at least 3 seconds have passed since the last one
-            if (sendNotification) {
-              const pairData = {
-                pair,
-                currentPrice,
-                previousPrice,
-                openPrice,
-                volume,
-              };
-
-              // Check for price breaches and send notifications
-              payload.push(pairData);
-              // Update the last notification timestamp and price
-              lastNotificationTime[pair] = now;
-              lastPrices[pair] = currentPrice;
-              lastHighPrices[pair] = highPrice;
-              lastLowPrices[pair] = lowPrice;
-            }
-          } else {
-            // init latestPrice and lastNotificationTime for a pair
-            lastPrices[pair] = currentPrice;
-            lastHighPrices[pair] = highPrice;
-            lastLowPrices[pair] = lowPrice;
-            lastNotificationTime[pair] = now - minNotificationTimeout;
-          }
+        const previousPrice = evaluateTicker({
+          stateKey: pair,
+          currentPrice,
+          highPrice,
+          lowPrice,
+          volume,
+          now,
+        });
+        if (previousPrice !== null) {
+          payload.push({ pair, currentPrice, previousPrice, openPrice, volume });
         }
       }
-      // send payload with actual Socket data
-      if (payload.length) {
-        await sendAnnouncement(payload);
-        lastSentNotificationTime = now;
-        // Update and save state
-        await updateState();
+    }
+    // send payload with actual Socket data
+    if (payload.length) {
+      await sendAnnouncement(payload);
+      lastSentNotificationTime = now;
+      // Update and save state
+      await updateState();
+    }
+  };
+
+  // Futures (USDⓈ-M) tickers: announce only pairs that are NOT traded on spot,
+  // so BTCUSDT-style duplicates stay silent. The endsWith check keeps
+  // perpetuals only — quarterly contracts (BTCUSDT_260327) are skipped.
+  const handleFuturesMessage = async (data) => {
+    // Until the spot symbol list has loaded we can't tell what is
+    // futures-only — stay silent instead of duplicating every spot pair.
+    if (!spotSymbols.size) return;
+    const messages = JSON.parse(data);
+    if (!Array.isArray(messages)) return;
+    const now = Date.now();
+    let payload = [];
+
+    for (const message of messages) {
+      if (message.e !== "24hrMiniTicker") continue;
+      const pair = message.s;
+      if (!pair || !pair.endsWith(QUOTE_SYMBOL)) continue;
+      // lastSocketData only ever holds spot symbols, so it doubles as a live
+      // fallback while the REST list is stale (e.g. a fresh spot listing).
+      // Only trust recent entries: a symbol delisted from spot stops updating,
+      // and its immortal (Redis-persisted) entry must not suppress futures
+      // announcements forever.
+      const spotSeen = lastSocketData[pair];
+      const spotSeenRecently =
+        spotSeen &&
+        typeof spotSeen.E === "number" &&
+        now - spotSeen.E < SPOT_SYMBOLS_REFRESH_MS;
+      if (spotSymbols.has(pair) || spotSeenRecently) continue;
+
+      const currentPrice = parseFloat(message.c);
+      const highPrice = parseFloat(message.h);
+      const lowPrice = parseFloat(message.l);
+      const openPrice = parseFloat(message.o);
+      const volume = parseFloat(message.q) || 0;
+      if (!Number.isFinite(currentPrice) || currentPrice <= 0) continue;
+
+      const previousPrice = evaluateTicker({
+        stateKey: FUTURES_KEY_PREFIX + pair,
+        currentPrice,
+        highPrice,
+        lowPrice,
+        volume,
+        now,
+      });
+      if (previousPrice !== null) {
+        payload.push({
+          pair,
+          currentPrice,
+          previousPrice,
+          openPrice,
+          volume,
+          futures: true,
+        });
       }
-    },
+    }
+    if (payload.length) {
+      await sendAnnouncement(payload);
+      lastSentNotificationTime = now;
+      await updateState();
+    }
   };
 
   const formatPrice = (p, fixLen = 2) => {
@@ -568,21 +662,39 @@ const main = async () => {
 
     return `${directionGlobal}${directionLocal}${coin} ${formatPrice(
       data.currentPrice
-    )} ${percent}% (${dailyPercent}%) ${volume}`;
+    )} ${percent}% (${dailyPercent}%) ${volume}${data.futures ? " F" : ""}`;
   };
 
-  let websocketStreamClient;
+  // Market-data streams (spot + futures) with per-stream heartbeat state for
+  // the shared watchdog below. The connector auto-reconnects when the socket
+  // fires 'close', but a half-open/zombie TCP can silently stop delivering
+  // data without ever closing — the watchdog covers that case.
+  const marketStreams = [];
 
-  // (Re)create the market-data stream. The connector auto-reconnects when the
-  // socket fires 'close', but a half-open/zombie TCP can silently stop
-  // delivering data without ever closing — the watchdog below covers that case.
-  const startMarketStream = () => {
-    websocketStreamClient = new WebsocketStream({
-      logger,
-      callbacks: websocketCallbacks,
-    });
-    websocketStreamClient.miniTicker();
-    lastWsMessageAt = Date.now();
+  const registerMarketStream = ({ label, wsURL, onMessage }) => {
+    const stream = { label, client: null, lastMessageAt: Date.now() };
+    const callbacks = {
+      open: () => logger.debug(`Connected with ${label} WebSocket server`),
+      close: () => logger.debug(`Disconnected with ${label} WebSocket server`),
+      message: async (data) => {
+        // Heartbeat for the watchdog: miniTicker pushes ~once per second, so a
+        // longer silence means the socket is dead even if it never fired
+        // 'close'.
+        stream.lastMessageAt = Date.now();
+        await onMessage(data);
+      },
+    };
+    stream.start = () => {
+      stream.client = new WebsocketStream({
+        logger,
+        callbacks,
+        ...(wsURL ? { wsURL } : {}),
+      });
+      stream.client.miniTicker();
+      stream.lastMessageAt = Date.now();
+    };
+    marketStreams.push(stream);
+    return stream;
   };
 
   const updateState = async () => {
@@ -605,36 +717,51 @@ const main = async () => {
   };
 
   // Subscribe to all pairs miniTicker and start watching the data flow.
-  startMarketStream();
+  registerMarketStream({ label: "spot", onMessage: handleSpotMessage }).start();
+  registerMarketStream({
+    label: "futures",
+    wsURL: FUTURES_WS_URL,
+    onMessage: handleFuturesMessage,
+  }).start();
+
+  // Load the spot symbol list used to filter futures-only pairs (it retries
+  // and refreshes on its own timer).
+  refreshSpotSymbols();
 
   // Watchdog: if no market data arrives for a while the socket is dead. Force
   // it closed so the connector reconnects (re-subscribing via the stream URL).
   const WS_STALE_TIMEOUT_MS = 60 * 1000;
   const WS_WATCHDOG_INTERVAL_MS = 15 * 1000;
   marketStreamWatchdog = setInterval(() => {
-    const silenceMs = Date.now() - lastWsMessageAt;
-    if (silenceMs <= WS_STALE_TIMEOUT_MS) return;
+    for (const stream of marketStreams) {
+      const silenceMs = Date.now() - stream.lastMessageAt;
+      if (silenceMs <= WS_STALE_TIMEOUT_MS) continue;
 
-    logger.error(
-      `No market data for ${Math.round(
-        silenceMs / 1000
-      )}s — forcing Binance websocket reconnect`
-    );
-    // Give the reconnect a full window to land before tripping again.
-    lastWsMessageAt = Date.now();
+      logger.error(
+        `No ${stream.label} market data for ${Math.round(
+          silenceMs / 1000
+        )}s — forcing Binance websocket reconnect`
+      );
+      // Give the reconnect a full window to land before tripping again.
+      stream.lastMessageAt = Date.now();
 
-    const ws = websocketStreamClient?.wsConnection?.ws;
-    if (ws && typeof ws.terminate === "function") {
-      // terminate() emits 'close' even on a half-open socket; the connector's
-      // close handler (closeInitiated === false) then reconnects on its own.
-      try {
-        ws.terminate();
-      } catch (error) {
-        logger.error("Failed to terminate stale websocket, recreating:", error);
-        startMarketStream();
+      const ws = stream.client?.wsConnection?.ws;
+      if (ws && typeof ws.terminate === "function") {
+        // terminate() emits 'close' even on a half-open socket; the
+        // connector's close handler (closeInitiated === false) then reconnects
+        // on its own.
+        try {
+          ws.terminate();
+        } catch (error) {
+          logger.error(
+            `Failed to terminate stale ${stream.label} websocket, recreating:`,
+            error
+          );
+          stream.start();
+        }
+      } else {
+        stream.start();
       }
-    } else {
-      startMarketStream();
     }
   }, WS_WATCHDOG_INTERVAL_MS);
 
@@ -742,6 +869,37 @@ function rawBodySaver(req, res, buf) {
   if (buf && buf.length) {
     req.rawBody = buf.toString("utf8");
   }
+}
+
+function fetchJson(url) {
+  return new Promise((resolve, reject) => {
+    const request = https.get(url, (res) => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        reject(new Error(`Unexpected status ${res.statusCode} from ${url}`));
+        return;
+      }
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => (body += chunk));
+      res.on("end", () => {
+        try {
+          resolve(JSON.parse(body));
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+    request.on("error", reject);
+    request.setTimeout(15000, () =>
+      request.destroy(new Error(`Request to ${url} timed out`))
+    );
+  });
+}
+
+async function fetchSpotSymbols() {
+  const tickers = await fetchJson(SPOT_SYMBOLS_URL);
+  return new Set(tickers.map((item) => item.symbol));
 }
 
 function parseList(value) {
@@ -904,6 +1062,9 @@ const shutdownBot = (signal) => {
   }
   if (marketStreamWatchdog) {
     clearInterval(marketStreamWatchdog);
+  }
+  if (spotSymbolsTimer) {
+    clearTimeout(spotSymbolsTimer);
   }
   bot.stop(signal);
 };
