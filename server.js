@@ -191,6 +191,7 @@ let lastPrices = {}; // Store the last prices for each coint
 let lastHighPrices = {}; //Store the last high prices for each coin
 let lastLowPrices = {}; //Store the last low prices for each coin
 let lastSocketData = {}; // Store all data which Socket returns
+let lastFuturesSocketData = {}; // Latest futures miniTicker per USDT perp
 let minPriceBreachTimeout = MIN_PRICE_BREACH_TIMEOUT;
 let minPriceBreachPercent = MIN_PRICE_BREACH_PERCENT;
 let minNotificationTimeout = MIN_NOTIFICATION_TIMEOUT;
@@ -233,6 +234,8 @@ const main = async () => {
       lastHighPrices = announcer.lastHighPrices || lastHighPrices;
       lastLowPrices = announcer.lastLowPrices || lastLowPrices;
       lastSocketData = announcer.lastSocketData || lastSocketData;
+      lastFuturesSocketData =
+        announcer.lastFuturesSocketData || lastFuturesSocketData;
       lastSentNotificationTime =
         announcer.lastSentNotificationTime || lastSentNotificationTime;
       minPriceBreachTimeout =
@@ -254,6 +257,7 @@ const main = async () => {
         lastHighPrices,
         lastLowPrices,
         lastSocketData,
+        lastFuturesSocketData,
         lastSentNotificationTime,
         minPriceBreachTimeout,
         minPriceBreachPercent,
@@ -354,8 +358,9 @@ const main = async () => {
       let text = "";
 
       if (msg && msg.text && /^\w+$/.test(msg.text)) {
+        const query = msg.text.toUpperCase();
         socketPairs = Object.keys(lastSocketData)
-          .map((e) => (e.includes(msg.text.toUpperCase()) ? e : ""))
+          .map((e) => (e.includes(query) ? e : ""))
           .filter(String);
         socketPairs.forEach((pair) => {
           const pairData = {
@@ -367,6 +372,26 @@ const main = async () => {
           };
           text += formatMessage(pairData) + "\n";
         });
+
+        // Futures-only pairs, shown TradingView-style (MUUUSDT.P). Pairs that
+        // are also spot-listed are already covered by the block above.
+        const now = Date.now();
+        Object.keys(lastFuturesSocketData)
+          .filter((pair) => pair.includes(query) && !isSpotListed(pair, now))
+          .forEach((pair) => {
+            const socketData = lastFuturesSocketData[pair];
+            const currentPrice = parseFloat(socketData.c);
+            const pairData = {
+              pair,
+              currentPrice,
+              previousPrice:
+                lastPrices[FUTURES_KEY_PREFIX + pair] ?? currentPrice,
+              openPrice: parseFloat(socketData.o),
+              volume: parseInt(socketData.q),
+              futures: true,
+            };
+            text += formatMessage(pairData) + "\n";
+          });
       }
 
       text.length ? ctx.replyWithHTML(text) : ctx.reply("Нет данных");
@@ -552,33 +577,42 @@ const main = async () => {
     }
   };
 
+  // A pair counts as spot-listed if the hourly REST list has it or the spot
+  // websocket saw it recently. Recency matters: a symbol delisted from spot
+  // stops updating, and its immortal (Redis-persisted) lastSocketData entry
+  // must not suppress futures announcements forever.
+  const isSpotListed = (pair, now) => {
+    if (spotSymbols.has(pair)) return true;
+    const spotSeen = lastSocketData[pair];
+    return (
+      Boolean(spotSeen) &&
+      typeof spotSeen.E === "number" &&
+      now - spotSeen.E < SPOT_SYMBOLS_REFRESH_MS
+    );
+  };
+
   // Futures (USDⓈ-M) tickers: announce only pairs that are NOT traded on spot,
   // so BTCUSDT-style duplicates stay silent. The endsWith check keeps
   // perpetuals only — quarterly contracts (BTCUSDT_260327) are skipped.
   const handleFuturesMessage = async (data) => {
-    // Until the spot symbol list has loaded we can't tell what is
-    // futures-only — stay silent instead of duplicating every spot pair.
-    if (!spotSymbols.size) return;
     const messages = JSON.parse(data);
     if (!Array.isArray(messages)) return;
     const now = Date.now();
+    // Until the spot symbol list has loaded we can't tell what is
+    // futures-only — collect lookup data but keep announcements silent
+    // instead of duplicating every spot pair.
+    const canAnnounce = spotSymbols.size > 0;
     let payload = [];
 
     for (const message of messages) {
       if (message.e !== "24hrMiniTicker") continue;
       const pair = message.s;
       if (!pair || !pair.endsWith(QUOTE_SYMBOL)) continue;
-      // lastSocketData only ever holds spot symbols, so it doubles as a live
-      // fallback while the REST list is stale (e.g. a fresh spot listing).
-      // Only trust recent entries: a symbol delisted from spot stops updating,
-      // and its immortal (Redis-persisted) entry must not suppress futures
-      // announcements forever.
-      const spotSeen = lastSocketData[pair];
-      const spotSeenRecently =
-        spotSeen &&
-        typeof spotSeen.E === "number" &&
-        now - spotSeen.E < SPOT_SYMBOLS_REFRESH_MS;
-      if (spotSymbols.has(pair) || spotSeenRecently) continue;
+      // Collect futures socket data for the symbol-lookup command. Stored for
+      // every USDT perp (even spot-listed ones) — the lookup filters at read
+      // time, so a later spot delisting doesn't lose data.
+      lastFuturesSocketData[pair] = message;
+      if (!canAnnounce || isSpotListed(pair, now)) continue;
 
       const currentPrice = parseFloat(message.c);
       const highPrice = parseFloat(message.h);
@@ -634,8 +668,9 @@ const main = async () => {
   };
 
   const formatMessage = (data) => {
-    // remove USDT from the message
-    let coin = data.pair.replace("USDT", "");
+    // spot pairs drop the quote asset; futures pairs are shown TradingView-
+    // style (MUUUSDT.P) so they're recognizable and paste straight into charts
+    let coin = data.futures ? `${data.pair}.P` : data.pair.replace("USDT", "");
     // get percent of coin change
     let percent =
       ((data.currentPrice - data.previousPrice) / data.previousPrice) * 100;
@@ -662,7 +697,7 @@ const main = async () => {
 
     return `${directionGlobal}${directionLocal}${coin} ${formatPrice(
       data.currentPrice
-    )} ${percent}% (${dailyPercent}%) ${volume}${data.futures ? " F" : ""}`;
+    )} ${percent}% (${dailyPercent}%) ${volume}`;
   };
 
   // Market-data streams (spot + futures) with per-stream heartbeat state for
@@ -705,6 +740,7 @@ const main = async () => {
       lastLowPrices,
       lastNotificationTime,
       lastSocketData,
+      lastFuturesSocketData,
       lastSentNotificationTime,
       minPriceBreachTimeout,
       minPriceBreachPercent,

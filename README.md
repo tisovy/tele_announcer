@@ -1,6 +1,6 @@
 # Tele Announcer
 
-Telegram-based notifier that watches Binance USDT markets (spot plus futures-only USDⓈ-M pairs, marked with an `F` suffix), tracks activity, and exposes a lightweight analytics API.
+Telegram-based notifier that watches Binance USDT markets (spot plus futures-only USDⓈ-M pairs, shown TradingView-style with a `.P` suffix), tracks activity, and exposes a lightweight analytics API.
 
 ## Quick start
 1. Install dependencies: `npm install`

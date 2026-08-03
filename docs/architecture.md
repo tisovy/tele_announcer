@@ -7,7 +7,7 @@ Tele Announcer orchestrates Binance websocket data, Redis-backed state, and Tele
 - Reads the required `TELE_ANNOUNCER` token, configures Telegraf, and wires up Express at `/analytics`.
 - Connects to Redis to persist the announcer's state (last prices, notifications, analytics snapshots) under `binance_announcer`.
 - Launches a Binance `WebsocketStream` that streams `24hrMiniTicker` events for every spot pair. Each update feeds the activity tracker, analytics engine, and notification logic.
-- Launches a second `WebsocketStream` against the USDⓈ-M futures endpoint (`wss://fstream.binance.com/market` — the routed `/market` path is mandatory since the 2026-04-23 legacy URL retirement) and runs the same notification logic for pairs that are **not** listed on spot, so futures-only listings get announced without duplicating spot pairs. Futures notifications carry an `F` suffix after the volume, and their state keys are namespaced with `F:` in Redis.
+- Launches a second `WebsocketStream` against the USDⓈ-M futures endpoint (`wss://fstream.binance.com/market` — the routed `/market` path is mandatory since the 2026-04-23 legacy URL retirement) and runs the same notification logic for pairs that are **not** listed on spot, so futures-only listings get announced without duplicating spot pairs. Futures pairs are rendered TradingView-style (`MUUUSDT.P`); their state keys are namespaced with `F:` in Redis.
 - Maintains an hourly-refreshed spot symbol list (`/api/v3/ticker/price`) used to decide which futures pairs are futures-only; futures announcements stay silent until that list has loaded.
 - Tracks per-symbol timing, percentage thresholds, and volume requirements before updating subscribers or persisting the refreshed state.
 
@@ -15,7 +15,7 @@ Tele Announcer orchestrates Binance websocket data, Redis-backed state, and Tele
 
 - The bot is protected by a whitelist (`USER_LIST`). Only matching chat IDs can send configuration commands or consume statistics.
 - Supported commands mutate thresholds: `n` (notification timeout), `p` (price notification percent), `pt` (price breach timeout), `pp` (price breach percent), and `v` (volume limit).
-- Users can also send a symbol to receive the most recent formatted data with HTML markup.
+- Users can also send a symbol (or a fragment like `MUU`) to receive the most recent formatted data with HTML markup. The lookup covers spot pairs and futures-only perps — the latter shown TradingView-style as `<PAIR>.P`.
 
 ## Analytics and activity tracking
 
